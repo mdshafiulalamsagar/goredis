@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"sort"
@@ -14,7 +15,13 @@ import (
 	"goredis/database"
 )
 
-// ANSI Color Codes for terminal UI formatting.
+// Application configuration.
+const (
+	PORT    = "6379" // Default Redis port.
+	VERSION = "0.4.0"
+)
+
+// ANSI Color Codes for server logs.
 const (
 	reset   = "\033[0m"
 	bold    = "\033[1m"
@@ -27,8 +34,6 @@ const (
 	white   = "\033[37m"
 )
 
-const version = "0.3.0"
-
 const banner = `
    ██████╗  ██████╗ ██████╗ ███████╗██████╗ ██╗███████╗
   ██╔════╝ ██╔═══██╗██╔══██╗██╔════╝██╔══██╗██║██╔════╝
@@ -38,128 +43,139 @@ const banner = `
    ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═════╝ ╚═╝╚══════╝`
 
 func main() {
+	// Initialize the shared in-memory database.
 	db := database.NewDatabase()
-	reader := bufio.NewReader(os.Stdin)
 
-	// Set up OS signal handling to gracefully shutdown the application (e.g., on Ctrl+C).
+	// Start listening for incoming TCP connections on the specified port.
+	// The server will bind to all available network interfaces (0.0.0.0).
+	listener, err := net.Listen("tcp", "0.0.0.0:"+PORT)
+	if err != nil {
+		fmt.Printf("Failed to start server on port %s: %v\n", PORT, err)
+		os.Exit(1)
+	}
+	defer listener.Close()
+
+	printBanner()
+
+	// Handle OS signals (Ctrl+C) to gracefully shutdown the server.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println()
-		fmt.Println(dim + "  bye, goredis out." + reset)
+		fmt.Println("\n" + dim + "Shutting down goredis server..." + reset)
+		listener.Close()
 		os.Exit(0)
 	}()
 
-	printBanner()
-
-	// Main Read-Eval-Print Loop (REPL).
+	// Infinite loop to accept new client connections.
 	for {
-		fmt.Print(bold + cyan + "goredis" + reset + bold + magenta + " > " + reset + " ")
-
-		line, err := reader.ReadString('\n')
+		// Accept blocks until a new client connects.
+		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println()
-			fmt.Println(dim + "  bye, goredis out." + reset)
-			return
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" {
+			// If the listener is closed (e.g., during shutdown), break the loop.
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				break
+			}
+			fmt.Printf("Failed to accept connection: %v\n", err)
 			continue
 		}
 
-		// Split the input by spaces to extract the command and arguments.
-		parts := strings.Fields(line)
-		cmd := strings.ToUpper(parts[0])
+		// Handle each client connection in a separate Goroutine.
+		// This allows the server to handle multiple clients simultaneously.
+		go handleClient(conn, db)
+	}
+}
 
-		// Command routing block.
-		switch cmd {
-		case "SET":
-			cmdSet(db, parts)
-		case "GET":
-			cmdGet(db, parts)
-		case "DEL":
-			cmdDel(db, parts)
-		case "EXISTS":
-			cmdExists(db, parts)
-		case "TTL":
-			cmdTTL(db, parts)
-		case "EXPIRE":
-			cmdExpire(db, parts)
-		case "PERSIST":
-			cmdPersist(db, parts)
-		case "KEYS":
-			cmdKeys(db)
-		case "DBSIZE":
-			cmdDBSize(db)
-		case "FLUSHALL":
-			cmdFlushAll(db)
-		case "INFO":
-			cmdInfo(db)
-		case "HELP", "?":
-			cmdHelp()
-		case "CLEAR", "CLS":
-			fmt.Print("\033[2J\033[H") // ANSI code to clear terminal screen.
-			printBanner()
-		case "VERSION":
-			fmt.Println("  " + yellow + "goredis" + reset + " v" + version + " " +
-				dim + "-" + reset + " " + magenta + "by sagar" + reset)
-		case "EXIT", "QUIT":
-			fmt.Println(dim + "  bye, goredis out." + reset)
+// handleClient reads commands from a connected client, processes them, and sends back responses.
+func handleClient(conn net.Conn, db *database.Database) {
+	defer conn.Close() // Ensure the connection is closed when the function exits.
+
+	// Log the new connection to the server terminal.
+	clientAddr := conn.RemoteAddr().String()
+	fmt.Printf("%s[CONNECT]%s Client connected from %s\n", green, reset, clientAddr)
+
+	// Create a buffered reader to read lines from the network connection.
+	reader := bufio.NewReader(conn)
+
+	for {
+		// Read until the newline character.
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			// If the client disconnects (EOF), log it and exit the loop.
+			fmt.Printf("%s[DISCONNECT]%s Client %s disconnected\n", red, reset, clientAddr)
 			return
-		default:
-			printError(fmt.Sprintf("unknown command '%s' - type HELP", parts[0]))
+		}
+
+		// Clean up the input string (remove newline and extra spaces).
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue // Ignore empty lines.
+		}
+
+		// Split the input into command and arguments.
+		parts := strings.Fields(line)
+		command := strings.ToUpper(parts[0])
+
+		// Process the command and get the response string.
+		// Responses must end with "\r\n" to follow standard network text protocols.
+		response := processCommand(db, command, parts)
+
+		// Send the response back to the client over the TCP connection.
+		_, err = conn.Write([]byte(response + "\r\n"))
+		if err != nil {
+			fmt.Printf("Failed to send response to %s: %v\n", clientAddr, err)
+			return
 		}
 	}
 }
 
-// printBanner displays the application logo and basic instructions.
-func printBanner() {
-	fmt.Println()
-	fmt.Println(cyan + banner + reset)
-	fmt.Println()
-	fmt.Println("            " + bold + "goredis" + reset +
-		" " + dim + "-" + reset + " " + magenta + "by sagar" + reset)
-	fmt.Println("            " + dim + "in-memory key-value store - built from scratch" + reset)
-	fmt.Println()
-	fmt.Println(dim + "            type " + reset + yellow + "HELP" + reset +
-		dim + " for commands - " + reset + yellow + "EXIT" + reset +
-		dim + " to quit" + reset)
-	fmt.Println()
-}
-
-// printOK prints a success message in green.
-func printOK(msg string) {
-	fmt.Println("  " + green + bold + "OK " + reset + green + msg + reset)
-}
-
-// printError prints an error message in red.
-func printError(msg string) {
-	fmt.Println("  " + red + bold + "ERR " + reset + red + msg + reset)
-}
-
-// printMuted prints a dimmed message.
-func printMuted(msg string) {
-	fmt.Println("  " + dim + msg + reset)
-}
-
-// formatDuration converts a time.Duration into a human-readable string.
-func formatDuration(d time.Duration) string {
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(d.Seconds()))
+// processCommand acts as the command router. It calls the appropriate handler
+// function based on the parsed command and returns a formatted string response.
+func processCommand(db *database.Database, cmd string, parts []string) string {
+	switch cmd {
+	case "PING":
+		return "PONG"
+	case "SET":
+		return cmdSet(db, parts)
+	case "GET":
+		return cmdGet(db, parts)
+	case "DEL":
+		return cmdDel(db, parts)
+	case "EXISTS":
+		return cmdExists(db, parts)
+	case "TTL":
+		return cmdTTL(db, parts)
+	case "EXPIRE":
+		return cmdExpire(db, parts)
+	case "PERSIST":
+		return cmdPersist(db, parts)
+	case "KEYS":
+		return cmdKeys(db)
+	case "DBSIZE":
+		return cmdDBSize(db)
+	case "FLUSHALL":
+		return cmdFlushAll(db)
+	case "INFO":
+		return cmdInfo(db)
+	case "VERSION":
+		return "goredis v" + VERSION + " - by sagar"
+	case "HELP", "?":
+		return cmdHelp()
+	case "EXIT", "QUIT":
+		return "BYE"
+	default:
+		return "ERR unknown command '" + parts[0] + "'"
 	}
-	if d < time.Hour {
-		return fmt.Sprintf("%dm %ds", int(d.Minutes()), int(d.Seconds())%60)
-	}
-	return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
 }
 
-// cmdSet handles the SET command. Usage: SET <key> <value> [EX <seconds>]
-func cmdSet(db *database.Database, parts []string) {
+// -------------------------------------------------------------------------
+// Command Handlers
+// These functions execute DB operations and return standard string responses.
+// -------------------------------------------------------------------------
+
+func cmdSet(db *database.Database, parts []string) string {
 	if len(parts) != 3 && len(parts) != 5 {
-		printError("usage: SET <key> <value> [EX <seconds>]")
-		return
+		return "ERR usage: SET <key> <value> [EX <seconds>]"
 	}
 
 	var ttl time.Duration = 0
@@ -167,125 +183,96 @@ func cmdSet(db *database.Database, parts []string) {
 	// Parse optional expiration time.
 	if len(parts) == 5 {
 		if strings.ToUpper(parts[3]) != "EX" {
-			printError("syntax error: expected 'EX'")
-			return
+			return "ERR syntax error: expected 'EX'"
 		}
 		seconds, err := strconv.Atoi(parts[4])
 		if err != nil || seconds <= 0 {
-			printError("invalid expiration time")
-			return
+			return "ERR invalid expiration time"
 		}
 		ttl = time.Duration(seconds) * time.Second
 	}
 
 	db.Set(parts[1], parts[2], ttl)
-	printOK("OK")
+	return "OK"
 }
 
-// cmdGet handles the GET command.
-func cmdGet(db *database.Database, parts []string) {
+func cmdGet(db *database.Database, parts []string) string {
 	if len(parts) != 2 {
-		printError("usage: GET <key>")
-		return
+		return "ERR usage: GET <key>"
 	}
 	val, ok := db.Get(parts[1])
 	if ok {
-		fmt.Println("  " + green + "\"" + val + "\"" + reset)
-	} else {
-		printMuted("(nil)")
+		return val // Return the raw value.
 	}
+	return "(nil)"
 }
 
-// cmdDel handles the DEL command.
-func cmdDel(db *database.Database, parts []string) {
+func cmdDel(db *database.Database, parts []string) string {
 	if len(parts) != 2 {
-		printError("usage: DEL <key>")
-		return
+		return "ERR usage: DEL <key>"
 	}
 	if db.Del(parts[1]) {
-		printOK("(integer) 1")
-	} else {
-		printMuted("(integer) 0")
+		return "(integer) 1"
 	}
+	return "(integer) 0"
 }
 
-// cmdExists handles the EXISTS command.
-func cmdExists(db *database.Database, parts []string) {
+func cmdExists(db *database.Database, parts []string) string {
 	if len(parts) != 2 {
-		printError("usage: EXISTS <key>")
-		return
+		return "ERR usage: EXISTS <key>"
 	}
 	if db.Exists(parts[1]) {
-		printOK("(integer) 1")
-	} else {
-		printMuted("(integer) 0")
+		return "(integer) 1"
 	}
+	return "(integer) 0"
 }
 
-// cmdTTL handles the TTL command to check remaining time on a key.
-func cmdTTL(db *database.Database, parts []string) {
+func cmdTTL(db *database.Database, parts []string) string {
 	if len(parts) != 2 {
-		printError("usage: TTL <key>")
-		return
+		return "ERR usage: TTL <key>"
 	}
 	ttl := db.TTL(parts[1])
-	if ttl == -2 {
-		fmt.Println("  " + yellow + "(integer) -2" + reset + dim + "  (key does not exist or expired)" + reset)
-	} else if ttl == -1 {
-		fmt.Println("  " + yellow + "(integer) -1" + reset + dim + "  (key has no expiration)" + reset)
-	} else {
-		fmt.Println("  " + yellow + fmt.Sprintf("(integer) %d", ttl) + reset + dim + " seconds remaining" + reset)
-	}
+	return fmt.Sprintf("(integer) %d", ttl)
 }
 
-// cmdExpire handles the EXPIRE command to set a timeout on an existing key.
-func cmdExpire(db *database.Database, parts []string) {
+func cmdExpire(db *database.Database, parts []string) string {
 	if len(parts) != 3 {
-		printError("usage: EXPIRE <key> <seconds>")
-		return
+		return "ERR usage: EXPIRE <key> <seconds>"
 	}
 	seconds, err := strconv.Atoi(parts[2])
 	if err != nil || seconds <= 0 {
-		printError("invalid expiration time")
-		return
+		return "ERR invalid expiration time"
 	}
 	if db.Expire(parts[1], time.Duration(seconds)*time.Second) {
-		printOK("(integer) 1")
-	} else {
-		printMuted("(integer) 0")
+		return "(integer) 1"
 	}
+	return "(integer) 0"
 }
 
-// cmdPersist handles the PERSIST command to remove an expiration from a key.
-func cmdPersist(db *database.Database, parts []string) {
+func cmdPersist(db *database.Database, parts []string) string {
 	if len(parts) != 2 {
-		printError("usage: PERSIST <key>")
-		return
+		return "ERR usage: PERSIST <key>"
 	}
 	if db.Persist(parts[1]) {
-		printOK("(integer) 1")
-	} else {
-		printMuted("(integer) 0")
+		return "(integer) 1"
 	}
+	return "(integer) 0"
 }
 
-// cmdDBSize handles the DBSIZE command.
-func cmdDBSize(db *database.Database) {
-	fmt.Println("  " + yellow + fmt.Sprintf("%d", db.Len()) + reset)
+func cmdDBSize(db *database.Database) string {
+	return fmt.Sprintf("(integer) %d", db.Len())
 }
 
-// cmdFlushAll handles the FLUSHALL command.
-func cmdFlushAll(db *database.Database) {
+func cmdFlushAll(db *database.Database) string {
 	n := db.FlushAll()
-	printOK(fmt.Sprintf("flushed %d keys", n))
+	return fmt.Sprintf("OK - flushed %d keys", n)
 }
 
-// cmdKeys displays all keys in a formatted table.
-func cmdKeys(db *database.Database) {
+// cmdKeys returns a formatted string representing a table of keys and values.
+func cmdKeys(db *database.Database) string {
 	snap := db.Snapshot()
 	if len(snap) == 0 {
-		printMuted("(empty database)")
-		return
+		return "(empty database)"
 	}
 
 	keys := make([]string, 0, len(snap))
@@ -293,67 +280,45 @@ func cmdKeys(db *database.Database) {
 	
 	for k, v := range snap {
 		keys = append(keys, k)
-		if len(k) > maxKey {
-			maxKey = len(k)
-		}
-		if len(v.Value) > maxVal {
-			maxVal = len(v.Value)
-		}
+		if len(k) > maxKey { maxKey = len(k) }
+		if len(v.Value) > maxVal { maxVal = len(v.Value) }
 		
-		// Determine string length for TTL column.
 		ttlStr := "permanent"
 		if !v.ExpiresAt.IsZero() {
 			ttlStr = fmt.Sprintf("%ds", int(time.Until(v.ExpiresAt).Seconds()))
 		}
-		if len(ttlStr) > maxTTL {
-			maxTTL = len(ttlStr)
-		}
+		if len(ttlStr) > maxTTL { maxTTL = len(ttlStr) }
 	}
 	sort.Strings(keys)
 
 	numW := len(fmt.Sprintf("%d", len(keys)))
+	var sb strings.Builder
 
-	// Construct table borders using Unicode box-drawing characters.
-	top := fmt.Sprintf("  %s+%s+%s+%s+%s+%s",
-		cyan, strings.Repeat("-", numW+2), strings.Repeat("-", maxKey+2),
-		strings.Repeat("-", maxVal+2), strings.Repeat("-", maxTTL+2), reset)
-	mid := fmt.Sprintf("  %s|%s|%s|%s|%s|%s",
-		cyan, strings.Repeat("-", numW+2), strings.Repeat("-", maxKey+2),
-		strings.Repeat("-", maxVal+2), strings.Repeat("-", maxTTL+2), reset)
-	bot := fmt.Sprintf("  %s+%s+%s+%s+%s+%s",
-		cyan, strings.Repeat("-", numW+2), strings.Repeat("-", maxKey+2),
-		strings.Repeat("-", maxVal+2), strings.Repeat("-", maxTTL+2), reset)
+	// Construct table borders. Since this is raw text over network, we avoid color codes here.
+	border := fmt.Sprintf("+%s+%s+%s+%s+",
+		strings.Repeat("-", numW+2), strings.Repeat("-", maxKey+2),
+		strings.Repeat("-", maxVal+2), strings.Repeat("-", maxTTL+2))
 
-	fmt.Println(top)
-	fmt.Printf("  %s|%s %s%-*s%s %s|%s %s%-*s%s %s|%s %s%-*s%s %s|%s %s%-*s%s %s|%s\n",
-		cyan, reset, yellow, numW, "#", reset,
-		cyan, reset, yellow, maxKey, "KEY", reset,
-		cyan, reset, yellow, maxVal, "VALUE", reset,
-		cyan, reset, yellow, maxTTL, "TTL", reset,
-		cyan, reset)
-	fmt.Println(mid)
+	sb.WriteString(border + "\r\n")
+	sb.WriteString(fmt.Sprintf("| %-*s | %-*s | %-*s | %-*s |\r\n", 
+		numW, "#", maxKey, "KEY", maxVal, "VALUE", maxTTL, "TTL"))
+	sb.WriteString(border + "\r\n")
 
 	for i, k := range keys {
 		ttlStr := "permanent"
-		ttlColor := dim
 		if !snap[k].ExpiresAt.IsZero() {
-			sec := int(time.Until(snap[k].ExpiresAt).Seconds())
-			ttlStr = fmt.Sprintf("%ds", sec)
-			ttlColor = red
+			ttlStr = fmt.Sprintf("%ds", int(time.Until(snap[k].ExpiresAt).Seconds()))
 		}
-		
-		fmt.Printf("  %s|%s %s%-*d%s %s|%s %s%-*s%s %s|%s %s%-*s%s %s|%s %s%-*s%s %s|%s\n",
-			cyan, reset, dim, numW, i+1, reset,
-			cyan, reset, white, maxKey, k, reset,
-			cyan, reset, white, maxVal, snap[k].Value, reset,
-			cyan, reset, ttlColor, maxTTL, ttlStr, reset,
-			cyan, reset)
+		sb.WriteString(fmt.Sprintf("| %-*d | %-*s | %-*s | %-*s |\r\n",
+			numW, i+1, maxKey, k, maxVal, snap[k].Value, maxTTL, ttlStr))
 	}
-	fmt.Println(bot)
+	sb.WriteString(border)
+	
+	return sb.String()
 }
 
-// cmdInfo displays server statistics.
-func cmdInfo(db *database.Database) {
+// cmdInfo returns the server statistics as formatted text.
+func cmdInfo(db *database.Database) string {
 	hits, misses, commands, uptime := db.Stats()
 	keys := db.Len()
 	hitRate := 0.0
@@ -361,31 +326,44 @@ func cmdInfo(db *database.Database) {
 		hitRate = float64(hits) / float64(hits+misses) * 100
 	}
 
-	row := func(label, val string) {
-		fmt.Printf("  %s|%s %s%-16s%s %s\n", cyan, reset, dim, label, reset, val)
-	}
+	var sb strings.Builder
+	sb.WriteString("-- GOREDIS INFO --\r\n")
+	sb.WriteString(fmt.Sprintf("Version:        %s\r\n", VERSION))
+	sb.WriteString(fmt.Sprintf("Author:         sagar\r\n"))
+	sb.WriteString(fmt.Sprintf("Uptime:         %s\r\n", formatDuration(uptime)))
+	sb.WriteString(fmt.Sprintf("Total Keys:     %d\r\n", keys))
+	sb.WriteString(fmt.Sprintf("Total Commands: %d\r\n", commands))
+	sb.WriteString(fmt.Sprintf("Get Hits:       %d\r\n", hits))
+	sb.WriteString(fmt.Sprintf("Get Misses:     %d\r\n", misses))
+	sb.WriteString(fmt.Sprintf("Hit Rate:       %.1f%%", hitRate))
+	
+	return sb.String()
+}
 
+func formatDuration(d time.Duration) string {
+	if d < time.Minute { return fmt.Sprintf("%ds", int(d.Seconds())) }
+	if d < time.Hour { return fmt.Sprintf("%dm %ds", int(d.Minutes()), int(d.Seconds())%60) }
+	return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+func printBanner() {
 	fmt.Println()
-	fmt.Println("  " + bold + cyan + "-- GOREDIS INFO --" + reset)
-	row("Version", version)
-	row("Author", magenta+"sagar"+reset)
-	row("Uptime", formatDuration(uptime))
-	row("Total Keys", green+fmt.Sprintf("%d", keys)+reset)
-	row("Total Commands", yellow+fmt.Sprintf("%d", commands)+reset)
-	row("Get Hits", green+fmt.Sprintf("%d", hits)+reset)
-	row("Get Misses", red+fmt.Sprintf("%d", misses)+reset)
-	row("Hit Rate", magenta+fmt.Sprintf("%.1f%%", hitRate)+reset)
+	fmt.Println(cyan + banner + reset)
+	fmt.Println()
+	fmt.Println("            " + bold + "goredis server" + reset +
+		" " + dim + "-" + reset + " " + magenta + "by sagar" + reset)
+	fmt.Println("            " + dim + "version " + VERSION + " - listening on port " + PORT + reset)
+	fmt.Println()
+	fmt.Println(dim + "            waiting for connections... (press Ctrl+C to stop)" + reset)
 	fmt.Println()
 }
 
-// cmdHelp displays the help menu.
-func cmdHelp() {
-	fmt.Println()
-	fmt.Println("  " + bold + cyan + "-- COMMANDS --" + reset)
-	fmt.Println()
-
-	type entry struct{ name, args, desc string }
-	cmds := []entry{
+// cmdHelp returns the list of available commands as a formatted string.
+func cmdHelp() string {
+	var sb strings.Builder
+	sb.WriteString("-- COMMANDS --\r\n")
+	
+	cmds := []struct{ name, args, desc string }{
 		{"SET", "<key> <value> [EX sec]", "store a key-value pair (optional expiry)"},
 		{"GET", "<key>", "retrieve value for key"},
 		{"DEL", "<key>", "delete a key"},
@@ -393,21 +371,17 @@ func cmdHelp() {
 		{"TTL", "<key>", "get remaining time to live"},
 		{"EXPIRE", "<key> <seconds>", "set a timeout on a key"},
 		{"PERSIST", "<key>", "remove the timeout from a key"},
-		{"KEYS", "", "list all keys (table)"},
+		{"KEYS", "", "list all keys (table format)"},
 		{"DBSIZE", "", "count of stored keys"},
 		{"FLUSHALL", "", "remove all keys"},
 		{"INFO", "", "server statistics"},
-		{"CLEAR", "", "clear terminal screen"},
-		{"VERSION", "", "show goredis version"},
+		{"PING", "", "test server connection"},
 		{"HELP", "", "show this help"},
-		{"EXIT", "", "quit goredis"},
+		{"EXIT", "", "disconnect from server"},
 	}
 
 	for _, c := range cmds {
-		fmt.Printf("  %s%-10s%s %s%-26s%s %s%s%s\n",
-			yellow, c.name, reset,
-			dim, c.args, reset,
-			white, c.desc, reset)
+		sb.WriteString(fmt.Sprintf("%-10s %-24s %s\r\n", c.name, c.args, c.desc))
 	}
-	fmt.Println()
+	return sb.String()
 }
