@@ -15,13 +15,11 @@ import (
 	"goredis/database"
 )
 
-// Application configuration.
 const (
-	PORT    = "6379" // Default Redis port.
-	VERSION = "0.4.0"
+	PORT    = "6379"
+	VERSION = "0.5.0" // Version bumped for Persistence
 )
 
-// ANSI Color Codes for server logs.
 const (
 	reset   = "\033[0m"
 	bold    = "\033[1m"
@@ -43,11 +41,20 @@ const banner = `
    ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═════╝ ╚═╝╚══════╝`
 
 func main() {
-	// Initialize the shared in-memory database.
 	db := database.NewDatabase()
 
-	// Start listening for incoming TCP connections on the specified port.
-	// The server will bind to all available network interfaces (0.0.0.0).
+	// Initialize the AOF logger
+	aof, err := database.NewAOFLogger("data.aof")
+	if err != nil {
+		fmt.Printf("Failed to open AOF file: %v\n", err)
+		os.Exit(1)
+	}
+	defer aof.Close()
+
+	// Load existing data before starting the server
+	loadAOF(db, "data.aof")
+
+	// Start TCP listener
 	listener, err := net.Listen("tcp", "0.0.0.0:"+PORT)
 	if err != nil {
 		fmt.Printf("Failed to start server on port %s: %v\n", PORT, err)
@@ -57,7 +64,7 @@ func main() {
 
 	printBanner()
 
-	// Handle OS signals (Ctrl+C) to gracefully shutdown the server.
+	// Handle OS signals (Ctrl+C)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -67,70 +74,62 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Infinite loop to accept new client connections.
+	// Accept connections
 	for {
-		// Accept blocks until a new client connects.
 		conn, err := listener.Accept()
 		if err != nil {
-			// If the listener is closed (e.g., during shutdown), break the loop.
 			if strings.Contains(err.Error(), "use of closed network connection") {
 				break
 			}
 			fmt.Printf("Failed to accept connection: %v\n", err)
 			continue
 		}
-
-		// Handle each client connection in a separate Goroutine.
-		// This allows the server to handle multiple clients simultaneously.
-		go handleClient(conn, db)
+		// Pass the 'aof' logger to handleClient
+		go handleClient(conn, db, aof)
 	}
 }
 
-// handleClient reads commands from a connected client, processes them, and sends back responses.
-func handleClient(conn net.Conn, db *database.Database) {
-	defer conn.Close() // Ensure the connection is closed when the function exits.
-
-	// Log the new connection to the server terminal.
+// handleClient now accepts the AOF logger
+func handleClient(conn net.Conn, db *database.Database, aof *database.AOFLogger) {
+	defer conn.Close()
 	clientAddr := conn.RemoteAddr().String()
 	fmt.Printf("%s[CONNECT]%s Client connected from %s\n", green, reset, clientAddr)
 
-	// Create a buffered reader to read lines from the network connection.
 	reader := bufio.NewReader(conn)
 
 	for {
-		// Read until the newline character.
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			// If the client disconnects (EOF), log it and exit the loop.
 			fmt.Printf("%s[DISCONNECT]%s Client %s disconnected\n", red, reset, clientAddr)
 			return
 		}
 
-		// Clean up the input string (remove newline and extra spaces).
 		line = strings.TrimSpace(line)
 		if line == "" {
-			continue // Ignore empty lines.
+			continue
 		}
 
-		// Split the input into command and arguments.
 		parts := strings.Fields(line)
 		command := strings.ToUpper(parts[0])
 
-		// Process the command and get the response string.
-		// Responses must end with "\r\n" to follow standard network text protocols.
 		response := processCommand(db, command, parts)
 
-		// Send the response back to the client over the TCP connection.
+		// Save to AOF if it's a mutating command and didn't result in an error
+		if isMutatingCommand(command) && !strings.HasPrefix(response, "ERR") {
+			cmdToSave := strings.Join(parts, " ")
+			err = aof.WriteCommand(cmdToSave)
+			if err != nil {
+				fmt.Printf("Failed to write to AOF: %v\n", err)
+			}
+		}
+
 		_, err = conn.Write([]byte(response + "\r\n"))
 		if err != nil {
-			fmt.Printf("Failed to send response to %s: %v\n", clientAddr, err)
 			return
 		}
 	}
 }
 
-// processCommand acts as the command router. It calls the appropriate handler
-// function based on the parsed command and returns a formatted string response.
 func processCommand(db *database.Database, cmd string, parts []string) string {
 	switch cmd {
 	case "PING":
@@ -168,19 +167,66 @@ func processCommand(db *database.Database, cmd string, parts []string) string {
 	}
 }
 
+// isMutatingCommand checks if a command changes the database state.
+func isMutatingCommand(cmd string) bool {
+	switch cmd {
+	case "SET", "DEL", "EXPIRE", "PERSIST", "FLUSHALL":
+		return true
+	}
+	return false
+}
+
+// loadAOF reads the Append-Only File and replays commands.
+func loadAOF(db *database.Database, filename string) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return // File doesn't exist, skip
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+
+		cmd := strings.ToUpper(parts[0])
+		switch cmd {
+		case "SET":
+			var ttl time.Duration = 0
+			if len(parts) == 5 && strings.ToUpper(parts[3]) == "EX" {
+				sec, err := strconv.Atoi(parts[4])
+				if err == nil {
+					ttl = time.Duration(sec) * time.Second
+				}
+			}
+			db.Set(parts[1], parts[2], ttl)
+		case "DEL":
+			db.Del(parts[1])
+		case "EXPIRE":
+			sec, err := strconv.Atoi(parts[2])
+			if err == nil {
+				db.Expire(parts[1], time.Duration(sec)*time.Second)
+			}
+		case "PERSIST":
+			db.Persist(parts[1])
+		case "FLUSHALL":
+			db.FlushAll()
+		}
+	}
+}
+
 // -------------------------------------------------------------------------
 // Command Handlers
-// These functions execute DB operations and return standard string responses.
 // -------------------------------------------------------------------------
 
 func cmdSet(db *database.Database, parts []string) string {
 	if len(parts) != 3 && len(parts) != 5 {
 		return "ERR usage: SET <key> <value> [EX <seconds>]"
 	}
-
 	var ttl time.Duration = 0
-
-	// Parse optional expiration time.
 	if len(parts) == 5 {
 		if strings.ToUpper(parts[3]) != "EX" {
 			return "ERR syntax error: expected 'EX'"
@@ -191,7 +237,6 @@ func cmdSet(db *database.Database, parts []string) string {
 		}
 		ttl = time.Duration(seconds) * time.Second
 	}
-
 	db.Set(parts[1], parts[2], ttl)
 	return "OK"
 }
@@ -202,7 +247,7 @@ func cmdGet(db *database.Database, parts []string) string {
 	}
 	val, ok := db.Get(parts[1])
 	if ok {
-		return val // Return the raw value.
+		return val
 	}
 	return "(nil)"
 }
@@ -268,7 +313,6 @@ func cmdFlushAll(db *database.Database) string {
 	return fmt.Sprintf("OK - flushed %d keys", n)
 }
 
-// cmdKeys returns a formatted string representing a table of keys and values.
 func cmdKeys(db *database.Database) string {
 	snap := db.Snapshot()
 	if len(snap) == 0 {
@@ -282,7 +326,6 @@ func cmdKeys(db *database.Database) string {
 		keys = append(keys, k)
 		if len(k) > maxKey { maxKey = len(k) }
 		if len(v.Value) > maxVal { maxVal = len(v.Value) }
-		
 		ttlStr := "permanent"
 		if !v.ExpiresAt.IsZero() {
 			ttlStr = fmt.Sprintf("%ds", int(time.Until(v.ExpiresAt).Seconds()))
@@ -294,7 +337,6 @@ func cmdKeys(db *database.Database) string {
 	numW := len(fmt.Sprintf("%d", len(keys)))
 	var sb strings.Builder
 
-	// Construct table borders. Since this is raw text over network, we avoid color codes here.
 	border := fmt.Sprintf("+%s+%s+%s+%s+",
 		strings.Repeat("-", numW+2), strings.Repeat("-", maxKey+2),
 		strings.Repeat("-", maxVal+2), strings.Repeat("-", maxTTL+2))
@@ -317,7 +359,6 @@ func cmdKeys(db *database.Database) string {
 	return sb.String()
 }
 
-// cmdInfo returns the server statistics as formatted text.
 func cmdInfo(db *database.Database) string {
 	hits, misses, commands, uptime := db.Stats()
 	keys := db.Len()
@@ -329,7 +370,7 @@ func cmdInfo(db *database.Database) string {
 	var sb strings.Builder
 	sb.WriteString("-- GOREDIS INFO --\r\n")
 	sb.WriteString(fmt.Sprintf("Version:        %s\r\n", VERSION))
-	sb.WriteString(fmt.Sprintf("Author:         sagar\r\n"))
+	sb.WriteString("Author:         sagar\r\n")
 	sb.WriteString(fmt.Sprintf("Uptime:         %s\r\n", formatDuration(uptime)))
 	sb.WriteString(fmt.Sprintf("Total Keys:     %d\r\n", keys))
 	sb.WriteString(fmt.Sprintf("Total Commands: %d\r\n", commands))
@@ -337,6 +378,31 @@ func cmdInfo(db *database.Database) string {
 	sb.WriteString(fmt.Sprintf("Get Misses:     %d\r\n", misses))
 	sb.WriteString(fmt.Sprintf("Hit Rate:       %.1f%%", hitRate))
 	
+	return sb.String()
+}
+
+func cmdHelp() string {
+	var sb strings.Builder
+	sb.WriteString("-- COMMANDS --\r\n")
+	cmds := []struct{ name, args, desc string }{
+		{"SET", "<key> <value> [EX sec]", "store a key-value pair"},
+		{"GET", "<key>", "retrieve value for key"},
+		{"DEL", "<key>", "delete a key"},
+		{"EXISTS", "<key>", "check if key exists"},
+		{"TTL", "<key>", "get remaining time to live"},
+		{"EXPIRE", "<key> <seconds>", "set a timeout on a key"},
+		{"PERSIST", "<key>", "remove timeout from key"},
+		{"KEYS", "", "list all keys (table format)"},
+		{"DBSIZE", "", "count of stored keys"},
+		{"FLUSHALL", "", "remove all keys"},
+		{"INFO", "", "server statistics"},
+		{"PING", "", "test connection"},
+		{"HELP", "", "show this help"},
+		{"EXIT", "", "disconnect"},
+	}
+	for _, c := range cmds {
+		sb.WriteString(fmt.Sprintf("%-10s %-24s %s\r\n", c.name, c.args, c.desc))
+	}
 	return sb.String()
 }
 
@@ -356,32 +422,4 @@ func printBanner() {
 	fmt.Println()
 	fmt.Println(dim + "            waiting for connections... (press Ctrl+C to stop)" + reset)
 	fmt.Println()
-}
-
-// cmdHelp returns the list of available commands as a formatted string.
-func cmdHelp() string {
-	var sb strings.Builder
-	sb.WriteString("-- COMMANDS --\r\n")
-	
-	cmds := []struct{ name, args, desc string }{
-		{"SET", "<key> <value> [EX sec]", "store a key-value pair (optional expiry)"},
-		{"GET", "<key>", "retrieve value for key"},
-		{"DEL", "<key>", "delete a key"},
-		{"EXISTS", "<key>", "check if key exists"},
-		{"TTL", "<key>", "get remaining time to live"},
-		{"EXPIRE", "<key> <seconds>", "set a timeout on a key"},
-		{"PERSIST", "<key>", "remove the timeout from a key"},
-		{"KEYS", "", "list all keys (table format)"},
-		{"DBSIZE", "", "count of stored keys"},
-		{"FLUSHALL", "", "remove all keys"},
-		{"INFO", "", "server statistics"},
-		{"PING", "", "test server connection"},
-		{"HELP", "", "show this help"},
-		{"EXIT", "", "disconnect from server"},
-	}
-
-	for _, c := range cmds {
-		sb.WriteString(fmt.Sprintf("%-10s %-24s %s\r\n", c.name, c.args, c.desc))
-	}
-	return sb.String()
 }
