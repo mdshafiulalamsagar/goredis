@@ -21,7 +21,7 @@
 - Go 1.21 or higher installed on your machine.
 
 ### Installation
-    git clone https://github.com/your-username/goredis.git
+    git clone https://github.com/mdshafiulalamsagar/goredis.git
     cd goredis
     go run .
 
@@ -68,8 +68,8 @@ This project was built from scratch to master Go concurrency and networking:
 
 ## Author
 **Sagar** 
-- LinkedIn: [Your LinkedIn URL]
-- GitHub: [@your-username](https://github.com/your-username)
+- LinkedIn: [(mdshafiulalamsagar/)](https://www.linkedin.com/in/mdshafiulalamsagar/)
+- GitHub: [@mdshafiulalamsagar](https://github.com/mdshafiulalamsagar)
 
 ## License
 This project is licensed under the MIT License - see the LICENSE file for details.
