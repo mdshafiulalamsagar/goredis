@@ -48,6 +48,11 @@ Open a new terminal window and connect using `telnet` or `netcat (nc)`:
 | `DBSIZE` | `DBSIZE` | Count total keys |
 | `FLUSHALL` | `FLUSHALL` | Remove all keys |
 | `INFO` | `INFO` | View server statistics |
+| `LPUSH` | `LPUSH <key> <value>` | Prepend an element to a list |
+| `LRANGE` | `LRANGE <key> <start> <stop>` | Get elements from a list |
+| `HSET` | `HSET <key> <field> <value>` | Set a field in a hash |
+| `HGET` | `HGET <key> <field>` | Get a field from a hash |
+| `HGETALL` | `HGETALL <key>` | Get all fields and values from a hash |
 
 ## Architecture and Learning Outcomes
 This project was built from scratch to master Go concurrency and networking:
@@ -63,7 +68,8 @@ This project was built from scratch to master Go concurrency and networking:
 - [x] TTL (Time-To-Live) and Expiry
 - [x] TCP Server (Networking)
 - [x] Persistence (AOF)
-- [ ] Implement RESP Protocol (Redis Serialization Protocol)
+- [x] Implement RESP Protocol (Redis Serialization Protocol)
+- [x] Core Data Structures (Lists & Hashes)
 - [ ] Custom CLI Client (instead of telnet)
 
 ## Author

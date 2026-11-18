@@ -1,2 +1,7 @@
 set name sagar
 set city dhaka
+set name sagar
+set name tonni
+set city dhaka
+LPUSH mylist apple
+LPUSH mylist banana
